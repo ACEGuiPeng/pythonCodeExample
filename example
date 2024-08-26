@@ -1,0 +1,100 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+@Time    : 2023/6/13 17:47
+@Version : 
+@File    : openapi_restful.py
+@Software: PyCharm
+@Author  : guipeng
+@Contact : aceguipeng@gmail.com
+"""
+import json
+
+import requests
+from tenacity import retry, TryAgain, wait_random_exponential, stop_after_attempt
+
+from common.logger import log
+from component.globals import GLOBALS
+from const import CONST
+from service.common_service import get_google_proxy, get_openai_proxy
+from setting import SETTING
+
+
+def list_models() -> list:
+    url = "https://api.openai.com/v1/models"
+    proxies = {}
+    try:
+        redis_wrapper = GLOBALS.get_redis_wrapper()
+        value = redis_wrapper.get(CONST.OPENAI_MODEL_CACHE_KEY)
+        if value:
+            model_list = json.loads(value)
+            return model_list
+
+        headers = __get_openai_headers()
+        proxies = get_google_proxy()
+        log.debug(f"Try to list models from server: {url}, proxies: {proxies}")
+        resp = requests.get(url=url, proxies=proxies, headers=headers,
+                            timeout=(SETTING.CONNECT_TIMEOUT, SETTING.OPENAI_READ_TIMEOUT))
+        status_code = resp.status_code
+        if 200 != status_code:
+            log.error(
+                f"ERROR to list models from server: {url},proxies: {proxies},status_code: {status_code},resp info: {resp.text}")
+            return []
+
+        resp_json = resp.json()
+        model_list = resp_json.get("data", [])
+        model_list.sort(key=lambda x: x.get(CONST.CREATED, ""), reverse=True)
+        redis_wrapper.set(CONST.OPENAI_MODEL_CACHE_KEY, json.dumps(model_list))
+        log.debug(f"SUCCESS to list models from server: {url},proxies: {proxies}, resp: {resp_json}")
+        return model_list
+    except Exception as e:
+        log.exception(f"ERROR to list model from server: {url},proxies: {proxies},error info: {str(e)}")
+        return []
+
+
+@retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(5))
+def create_chat_completion(model: str, message_list: list):
+    url = "https://api.openai.com/v1/chat/completions"
+    proxies = {}
+    json_body = {}
+    try:
+        headers = __get_openai_headers()
+        proxies = get_openai_proxy()
+
+        json_body = {
+            CONST.MODEL: model,
+            CONST.MESSAGES: message_list,
+        }
+        log.debug(f"Try to create chat from server: {url}, proxies: {proxies},json body: {json_body}")
+        resp = requests.post(url=url, proxies=proxies, headers=headers, json=json_body,
+                             timeout=(SETTING.OPENAI_CONNECT_TIMEOUT, SETTING.OPENAI_READ_TIMEOUT))
+        status_code = resp.status_code
+        if 200 != status_code:
+            log.error(
+                f"ERROR to create chat from server: {url},proxies: {proxies}, json body: {json_body},status_code: {status_code},resp info: {resp.text}")
+            return ""
+
+        resp_json = resp.json()
+        choices = resp_json.get(CONST.CHOICES)
+        if not choices:
+            return ""
+
+        content = choices[0].get(CONST.MESSAGE, {}).get(CONST.CONTENT, "")
+        log.debug(
+            f"SUCCESS to create chat from server: {url},proxies: {proxies}, json body: {json_body}, resp: {resp_json}")
+        return content
+    except IOError as e:
+        log.exception(
+            f"ERROR to list model from server: {url},proxies: {proxies}, json body: {json_body},error info: {str(e)},try to retry")
+        raise TryAgain
+    except Exception as e:
+        log.exception(
+            f"ERROR to list model from server: {url},proxies: {proxies}, json body: {json_body},error info: {str(e)}")
+        return ""
+
+
+def __get_openai_headers():
+    headers = {
+        CONST.AUTHORIZATION: f"Bearer {SETTING.OPENAI_API_KEY}"
+    }
+    return headers
